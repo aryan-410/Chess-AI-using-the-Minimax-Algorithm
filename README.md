@@ -1,1 +1,1 @@
-# Chess-AI
+# Chess AI: Harnessing Minimax for Masterful Moves
