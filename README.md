@@ -1,5 +1,5 @@
 # 🚨 IMPORTANT UPDATE 🚨
-**As of 27th September 2023, the latest algorithm has been taken down due to issues in the source code and memory complications.** We apologize for any inconvenience caused. A revised and cleaner version of the code is in the works and is scheduled to be uploaded by 15th October 2023. Please bear with us as we work to enhance your experience. Thank you for your patience and understanding.
+**As of 27th September 2023, the latest algorithm has been taken down due to issues in the source code and memory complications.** I apologize for any inconvenience caused. A revised and cleaner version of the code is in the works and is scheduled to be uploaded by 15th October 2023.
 
 
 # 🛡️ Chess AI: Harnessing Minimax for Masterful Moves 🛡️
