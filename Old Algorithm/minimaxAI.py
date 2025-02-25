@@ -58,9 +58,9 @@ def minimax(board, depth , alpha, beta, maximizingPlayer, color):
 
     if depth == 0 or isWon(board, 'kW') or isWon(board, 'kB'):
         if isWon(board, 'kB'):
-            return (None, -10000000000000000000000000, None)
+            return (None, -math.inf, None)
         elif isWon(board, 'kW'):
-            return (None, 1000000000000000000000, None)
+            return (None, math.inf, None)
         else:
             return (None, evaluation(board), None)
 

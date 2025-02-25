@@ -1,0 +1,1294 @@
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Scanner;
+
+/**
+ * A comprehensive, console-based chess program in Java using bitboards.
+ * 
+ * This code demonstrates:
+ * - Initializing the board with bitboards
+ * - Generating moves for each piece type
+ * - Checking move legality (checks, captures, en passant, castling, promotions)
+ * - Detecting checkmate, stalemate, and 50-move rule draws
+ * - A simple console-based user interface for two human players.
+ *
+ * NOTE: This code is for demonstration/education and may need additional
+ * testing or fine-tuning for production-level stability.
+ */
+public class BitboardChess {
+
+    // -------------------------------------------------------------------------
+    // Bitboard fields: one long (64 bits) per piece type & color
+    // -------------------------------------------------------------------------
+    private long WP, WN, WB, WR, WQ, WK;
+    private long BP, BN, BB, BR, BQ, BK;
+
+    // Side to move: true = White, false = Black
+    private boolean whiteToMove;
+
+    // Castling rights stored as bits:
+    //    1  (0x1) = White can castle kingside
+    //    2  (0x2) = White can castle queenside
+    //    4  (0x4) = Black can castle kingside
+    //    8  (0x8) = Black can castle queenside
+    private int castlingRights;
+
+    // En Passant target square: -1 if none; 0..63 for board squares
+    private int enPassantSquare;
+
+    // Halfmove clock for 50-move rule
+    private int halfmoveClock;
+
+    // Fullmove number (increments after Black's move)
+    private int fullmoveNumber;
+
+    // Castling constants
+    private static final int WHITE_KINGSIDE  = 1;  // 0b0001
+    private static final int WHITE_QUEENSIDE = 2;  // 0b0010
+    private static final int BLACK_KINGSIDE  = 4;  // 0b0100
+    private static final int BLACK_QUEENSIDE = 8;  // 0b1000
+
+    // The board is labeled as follows in bitboard indexing (0-based):
+    //  a1=0, b1=1, c1=2, ..., h1=7
+    //  a2=8, b2=9, ..., h2=15
+    //  ...
+    //  a8=56,              ..., h8=63
+    //
+    //  This is "little-endian rank-file mapping" (least significant bit = a1).
+
+    // -------------------------------------------------------------------------
+    // Constructor: sets up the initial chess position
+    // -------------------------------------------------------------------------
+    public BitboardChess() {
+        // White Pawns on rank 2
+        WP = 0x000000000000FF00L; // bits 8..15 set
+        // White Rooks on a1, h1
+        WR = 0x0000000000000081L; // bits 0,7
+        // White Knights on b1, g1
+        WN = 0x0000000000000042L; // bits 1,6
+        // White Bishops on c1, f1
+        WB = 0x0000000000000024L; // bits 2,5
+        // White Queen on d1
+        WQ = 0x0000000000000008L; // bit 3
+        // White King on e1
+        WK = 0x0000000000000010L; // bit 4
+
+        // Black Pawns on rank 7
+        BP = 0x00FF000000000000L; // bits 48..55
+        // Black Rooks on a8, h8
+        BR = 0x8100000000000000L; // bits 56,63
+        // Black Knights on b8, g8
+        BN = 0x4200000000000000L; // bits 57,62
+        // Black Bishops on c8, f8
+        BB = 0x2400000000000000L; // bits 58,61
+        // Black Queen on d8
+        BQ = 0x0800000000000000L; // bit 59
+        // Black King on e8
+        BK = 0x1000000000000000L; // bit 60
+
+        // White to move first
+        whiteToMove = true;
+
+        // Both sides can castle both ways initially
+        castlingRights = WHITE_KINGSIDE | WHITE_QUEENSIDE | BLACK_KINGSIDE | BLACK_QUEENSIDE;
+
+        // No en passant initially
+        enPassantSquare = -1;
+
+        // Zero halfmoves
+        halfmoveClock = 0;
+
+        // Fullmove number = 1
+        fullmoveNumber = 1;
+    }
+
+    // -------------------------------------------------------------------------
+    // Main method: runs the game loop
+    // -------------------------------------------------------------------------
+    public static void main(String[] args) {
+        BitboardChess game = new BitboardChess();
+        game.playGame();
+    }
+
+    // -------------------------------------------------------------------------
+    // Play loop: prints board, reads user moves, updates state, checks for game end
+    // -------------------------------------------------------------------------
+    public void playGame() {
+        Scanner sc = new Scanner(System.in);
+
+        while (true) {
+            printBoard();
+            if (isCheckmate()) {
+                System.out.println((whiteToMove ? "White" : "Black") + " is checkmated!");
+                System.out.println("Game over.");
+                break;
+            } else if (isStalemate()) {
+                System.out.println("Stalemate! Game over.");
+                break;
+            } else if (halfmoveClock >= 50) {
+                System.out.println("50-move rule draw! Game over.");
+                break;
+            }
+
+            System.out.print((whiteToMove ? "White" : "Black") + " to move (e.g. e2e4, or e7e8Q): ");
+            String moveStr = sc.nextLine().trim();
+
+            if (moveStr.equalsIgnoreCase("quit")) {
+                System.out.println("Game terminated by user.");
+                break;
+            }
+
+            // Attempt to parse and make the move
+            if (!tryMove(moveStr)) {
+                System.out.println("Invalid move. Please try again.");
+                continue;
+            }
+
+            // If the move was valid and made, switch sides
+            if (!whiteToMove) {
+                // Completed a full move
+                fullmoveNumber++;
+            }
+            whiteToMove = !whiteToMove;
+        }
+
+        sc.close();
+    }
+
+    // -------------------------------------------------------------------------
+    // Tries to parse a move in algebraic format (e.g. e2e4, e7e8Q).
+    // If valid, executes it and returns true. Else returns false.
+    // -------------------------------------------------------------------------
+    public boolean tryMove(String algebraic) {
+        if (algebraic.length() < 4) {
+            return false;
+        }
+
+        // Example: "e2e4" => from = e2, to = e4
+        // squares: e2 => file 'e' -> 4, rank '2' -> 1 => index = 8*1 + 4 = 12
+        //           e4 => file 'e' -> 4, rank '4' -> 3 => index = 8*3 + 4 = 28
+        int fromSq = notationToIndex(algebraic.substring(0, 2));
+        int toSq = notationToIndex(algebraic.substring(2, 4));
+        if (fromSq < 0 || fromSq > 63 || toSq < 0 || toSq > 63) {
+            return false;
+        }
+
+        char promotionChar = 0;
+        if (algebraic.length() == 5) {
+            promotionChar = algebraic.charAt(4);
+        }
+
+        // Generate all legal moves
+        List<Move> moves = generateLegalMoves();
+        for (Move m : moves) {
+            if (m.from == fromSq && m.to == toSq) {
+                // Check if promotion piece is required
+                if (m.isPromotion) {
+                    // If user didn't specify or mismatch => continue
+                    if (promotionChar == 0) return false;
+                    if (!promotionMatches(m.promotionPiece, promotionChar)) {
+                        continue; 
+                    }
+                }
+                // If the move matches, apply it
+                doMove(m);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private boolean promotionMatches(int piece, char c) {
+        // piece is one of: 'Q','R','B','N' internally
+        // c is user input
+        // We'll store promotion piece type as same internal code, so check:
+        int internal = charToPromotionPiece(c, whiteToMove);
+        return (piece == internal);
+    }
+
+    // -------------------------------------------------------------------------
+    // Move object to hold from, to, flags (capture, en-passant, promotion, etc.)
+    // -------------------------------------------------------------------------
+    private static class Move {
+        int from, to;
+        boolean isEnPassant;
+        boolean isCastling;
+        boolean isPromotion;
+        int promotionPiece; // internal code for new piece (Q=1,R=2,B=3,N=4 for example)
+
+        Move(int from, int to) {
+            this.from = from;
+            this.to = to;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Generate all *legal* moves for the side to move
+    // -------------------------------------------------------------------------
+    public List<Move> generateLegalMoves() {
+        List<Move> moves = generateAllPseudoLegalMoves();
+        List<Move> legal = new ArrayList<>();
+
+        for (Move m : moves) {
+            // Make the move on a temporary copy of the board
+            BoardState backup = new BoardState(this);
+            doMove(m);
+
+            // Check if own king is in check after this move
+            if (!isKingInCheck(!whiteToMove)) {
+                legal.add(m);
+            }
+            // Revert the board
+            restoreState(backup);
+        }
+
+        return legal;
+    }
+
+    // -------------------------------------------------------------------------
+    // Generate all pseudo-legal moves (ignoring check) for the side to move
+    // -------------------------------------------------------------------------
+    public List<Move> generateAllPseudoLegalMoves() {
+        if (whiteToMove) {
+            return generateWhiteMoves();
+        } else {
+            return generateBlackMoves();
+        }
+    }
+
+    // =========== Move generation for White ====================================
+    private List<Move> generateWhiteMoves() {
+        List<Move> moves = new ArrayList<>();
+        long occupancy = getAllPieces();
+        long myPieces = getWhitePieces();
+
+        // 1) Generate Pawn moves
+        moves.addAll(generateWhitePawnMoves(WP, occupancy));
+
+        // 2) Knights
+        long knights = WN;
+        while (knights != 0) {
+            int sq = Long.numberOfTrailingZeros(knights);
+            long bb = 1L << sq;
+            knights &= ~bb;
+            moves.addAll(generateKnightMoves(sq, bb, myPieces));
+        }
+
+        // 3) Bishops
+        long bishops = WB;
+        while (bishops != 0) {
+            int sq = Long.numberOfTrailingZeros(bishops);
+            long bb = 1L << sq;
+            bishops &= ~bb;
+            moves.addAll(generateBishopMoves(sq, bb, myPieces));
+        }
+
+        // 4) Rooks
+        long rooks = WR;
+        while (rooks != 0) {
+            int sq = Long.numberOfTrailingZeros(rooks);
+            long bb = 1L << sq;
+            rooks &= ~bb;
+            moves.addAll(generateRookMoves(sq, bb, myPieces));
+        }
+
+        // 5) Queens
+        long queens = WQ;
+        while (queens != 0) {
+            int sq = Long.numberOfTrailingZeros(queens);
+            long bb = 1L << sq;
+            queens &= ~bb;
+            moves.addAll(generateQueenMoves(sq, bb, myPieces));
+        }
+
+        // 6) King
+        moves.addAll(generateKingMoves(WK, myPieces));
+
+        // 7) Castling
+        moves.addAll(generateWhiteCastlingMoves());
+
+        return moves;
+    }
+
+    // =========== Move generation for Black ====================================
+    private List<Move> generateBlackMoves() {
+        List<Move> moves = new ArrayList<>();
+        long occupancy = getAllPieces();
+        long myPieces = getBlackPieces();
+
+        // 1) Generate Pawn moves
+        moves.addAll(generateBlackPawnMoves(BP, occupancy));
+
+        // 2) Knights
+        long knights = BN;
+        while (knights != 0) {
+            int sq = Long.numberOfTrailingZeros(knights);
+            long bb = 1L << sq;
+            knights &= ~bb;
+            moves.addAll(generateKnightMoves(sq, bb, myPieces));
+        }
+
+        // 3) Bishops
+        long bishops = BB;
+        while (bishops != 0) {
+            int sq = Long.numberOfTrailingZeros(bishops);
+            long bb = 1L << sq;
+            bishops &= ~bb;
+            moves.addAll(generateBishopMoves(sq, bb, myPieces));
+        }
+
+        // 4) Rooks
+        long rooks = BR;
+        while (rooks != 0) {
+            int sq = Long.numberOfTrailingZeros(rooks);
+            long bb = 1L << sq;
+            rooks &= ~bb;
+            moves.addAll(generateRookMoves(sq, bb, myPieces));
+        }
+
+        // 5) Queens
+        long queens = BQ;
+        while (queens != 0) {
+            int sq = Long.numberOfTrailingZeros(queens);
+            long bb = 1L << sq;
+            queens &= ~bb;
+            moves.addAll(generateQueenMoves(sq, bb, myPieces));
+        }
+
+        // 6) King
+        moves.addAll(generateKingMoves(BK, myPieces));
+
+        // 7) Castling
+        moves.addAll(generateBlackCastlingMoves());
+
+        return moves;
+    }
+
+    // -------------------------------------------------------------------------
+    // Pawn move generation (White)
+    // -------------------------------------------------------------------------
+    private List<Move> generateWhitePawnMoves(long pawns, long occupancy) {
+        List<Move> list = new ArrayList<>();
+        long emptySquares = ~occupancy;
+
+        // Single push
+        long oneStep = (pawns << 8) & emptySquares;
+        // For those on rank 2 (row 1) that can move two steps
+        long twoStep = ((oneStep & 0x000000FF00000000L) << 8) & emptySquares;
+
+        // 1) Single pushes
+        long temp = oneStep;
+        while (temp != 0) {
+            int to = Long.numberOfTrailingZeros(temp);
+            long bb = 1L << to;
+            temp &= ~bb;
+
+            int from = to - 8;
+
+            if (to >= 56) {
+                // Promotion
+                for (int promo : new int[] {1,2,3,4}) {
+                    Move m = new Move(from, to);
+                    m.isPromotion = true;
+                    m.promotionPiece = promo; // Q,R,B,N
+                    list.add(m);
+                }
+            } else {
+                Move m = new Move(from, to);
+                list.add(m);
+            }
+        }
+
+        // 2) Double pushes
+        temp = twoStep;
+        while (temp != 0) {
+            int to = Long.numberOfTrailingZeros(temp);
+            long bb = 1L << to;
+            temp &= ~bb;
+
+            int from = to - 16;
+            Move m = new Move(from, to);
+            // Might set enPassantSquare if needed
+            list.add(m);
+        }
+
+        // 3) Captures
+        // White captures: shift pawns left 7 & right 7
+        // Left capture
+        long leftCapture = (pawns << 7) & (getBlackPieces()) & 0xFEFEFEFEFEFEFEFEL;
+        // Right capture
+        long rightCapture = (pawns << 9) & (getBlackPieces()) & 0x7F7F7F7F7F7F7F7FL;
+
+        // Handle promotions in captures
+        long tempCap = leftCapture;
+        while (tempCap != 0) {
+            int to = Long.numberOfTrailingZeros(tempCap);
+            long bb = 1L << to;
+            tempCap &= ~bb;
+            int from = to - 7;
+            if (to >= 56) {
+                // Promotion
+                for (int promo : new int[] {1,2,3,4}) {
+                    Move m = new Move(from, to);
+                    m.isPromotion = true;
+                    m.promotionPiece = promo;
+                    list.add(m);
+                }
+            } else {
+                list.add(new Move(from, to));
+            }
+        }
+
+        tempCap = rightCapture;
+        while (tempCap != 0) {
+            int to = Long.numberOfTrailingZeros(tempCap);
+            long bb = 1L << to;
+            tempCap &= ~bb;
+            int from = to - 9;
+            if (to >= 56) {
+                // Promotion
+                for (int promo : new int[] {1,2,3,4}) {
+                    Move m = new Move(from, to);
+                    m.isPromotion = true;
+                    m.promotionPiece = promo;
+                    list.add(m);
+                }
+            } else {
+                list.add(new Move(from, to));
+            }
+        }
+
+        // 4) En-passant
+        if (enPassantSquare != -1) {
+            // White can capture en passant if it is on the 5th rank row 4
+            // enPassantSquare is the 'to' square
+            // The capturing pawn is from enPassantSquare-8, but only if it lines up
+            // Actually, we check if any white pawn can capture that square
+            long epMask = 1L << enPassantSquare;
+            // White's left capture
+            long epLeft = (pawns << 7) & 0xFEFEFEFEFEFEFEFEL;
+            // White's right capture
+            long epRight = (pawns << 9) & 0x7F7F7F7F7F7F7F7FL;
+            if ((epLeft & epMask) != 0) {
+                // from is enPassantSquare-7
+                int to = enPassantSquare;
+                int from = to - 7;
+                Move m = new Move(from, to);
+                m.isEnPassant = true;
+                list.add(m);
+            }
+            if ((epRight & epMask) != 0) {
+                // from is enPassantSquare-9
+                int to = enPassantSquare;
+                int from = to - 9;
+                Move m = new Move(from, to);
+                m.isEnPassant = true;
+                list.add(m);
+            }
+        }
+
+        return list;
+    }
+
+    // -------------------------------------------------------------------------
+    // Pawn move generation (Black)
+    // -------------------------------------------------------------------------
+    private List<Move> generateBlackPawnMoves(long pawns, long occupancy) {
+        List<Move> list = new ArrayList<>();
+        long emptySquares = ~occupancy;
+
+        // Single push
+        long oneStep = (pawns >>> 8) & emptySquares;
+        // For those on rank 7 (row 6) that can move two steps
+        long twoStep = ((oneStep & 0x0000FF0000000000L) >>> 8) & emptySquares;
+
+        // 1) Single pushes
+        long temp = oneStep;
+        while (temp != 0) {
+            int to = Long.numberOfTrailingZeros(temp);
+            long bb = 1L << to;
+            temp &= ~bb;
+
+            int from = to + 8;
+
+            if (to < 8) {
+                // Promotion
+                for (int promo : new int[] {1,2,3,4}) {
+                    Move m = new Move(from, to);
+                    m.isPromotion = true;
+                    m.promotionPiece = promo; // Q,R,B,N (but for black we track same code)
+                    list.add(m);
+                }
+            } else {
+                list.add(new Move(from, to));
+            }
+        }
+
+        // 2) Double pushes
+        temp = twoStep;
+        while (temp != 0) {
+            int to = Long.numberOfTrailingZeros(temp);
+            long bb = 1L << to;
+            temp &= ~bb;
+
+            int from = to + 16;
+            Move m = new Move(from, to);
+            list.add(m);
+        }
+
+        // 3) Captures
+        // Black captures: shift pawns right 7 & left 7 from black perspective
+        // Actually, from bitboard standpoint: left shift is <<, right shift is >>
+        long leftCapture  = (pawns >>> 9) & getWhitePieces() & 0x007F7F7F7F7F7F7FL;
+        long rightCapture = (pawns >>> 7) & getWhitePieces() & 0x00FEFEFEFEFEFEFEL;
+
+        long tempCap = leftCapture;
+        while (tempCap != 0) {
+            int to = Long.numberOfTrailingZeros(tempCap);
+            long bb = 1L << to;
+            tempCap &= ~bb;
+            int from = to + 9;
+            if (to < 8) {
+                // Promotion
+                for (int promo : new int[] {1,2,3,4}) {
+                    Move m = new Move(from, to);
+                    m.isPromotion = true;
+                    m.promotionPiece = promo;
+                    list.add(m);
+                }
+            } else {
+                list.add(new Move(from, to));
+            }
+        }
+
+        tempCap = rightCapture;
+        while (tempCap != 0) {
+            int to = Long.numberOfTrailingZeros(tempCap);
+            long bb = 1L << to;
+            tempCap &= ~bb;
+            int from = to + 7;
+            if (to < 8) {
+                // Promotion
+                for (int promo : new int[] {1,2,3,4}) {
+                    Move m = new Move(from, to);
+                    m.isPromotion = true;
+                    m.promotionPiece = promo;
+                    list.add(m);
+                }
+            } else {
+                list.add(new Move(from, to));
+            }
+        }
+
+        // 4) En-passant
+        if (enPassantSquare != -1) {
+            long epMask = 1L << enPassantSquare;
+            // For black, we shift pawns >> 7 or >> 9
+            long epLeft  = (pawns >>> 9) & 0x007F7F7F7F7F7F7FL;
+            long epRight = (pawns >>> 7) & 0x00FEFEFEFEFEFEFEL;
+            if ((epLeft & epMask) != 0) {
+                int to = enPassantSquare;
+                int from = to + 9;
+                Move m = new Move(from, to);
+                m.isEnPassant = true;
+                list.add(m);
+            }
+            if ((epRight & epMask) != 0) {
+                int to = enPassantSquare;
+                int from = to + 7;
+                Move m = new Move(from, to);
+                m.isEnPassant = true;
+                list.add(m);
+            }
+        }
+
+        return list;
+    }
+
+    // -------------------------------------------------------------------------
+    // Knight moves
+    // -------------------------------------------------------------------------
+    private List<Move> generateKnightMoves(int sq, long bb, long myPieces) {
+        List<Move> list = new ArrayList<>();
+        long attacks = knightAttacks(sq) & ~myPieces;
+        while (attacks != 0) {
+            int to = Long.numberOfTrailingZeros(attacks);
+            attacks &= ~(1L << to);
+            list.add(new Move(sq, to));
+        }
+        return list;
+    }
+
+    private long knightAttacks(int sq) {
+        // Precompute or do offsets?
+        // We'll do offsets for demonstration:
+        // Offsets for knights: ±17, ±15, ±10, ±6 in bitboard indexing
+        long mask = 0L;
+        int[] offsets = {17, 15, 10, 6, -17, -15, -10, -6};
+        int rank = sq / 8;
+        int file = sq % 8;
+        for (int off : offsets) {
+            int target = sq + off;
+            if (target < 0 || target > 63) continue;
+            int trank = target / 8;
+            int tfile = target % 8;
+            // Knight can't jump across ranks incorrectly
+            if (Math.abs(trank - rank) > 2) continue;
+            if (Math.abs(tfile - file) > 2) continue;
+            mask |= (1L << target);
+        }
+        return mask;
+    }
+
+    // -------------------------------------------------------------------------
+    // Bishop moves (sliding)
+    // -------------------------------------------------------------------------
+    private List<Move> generateBishopMoves(int sq, long bb, long myPieces) {
+        List<Move> list = new ArrayList<>();
+        long bishopAttacks = bishopAttacks(sq, getAllPieces()) & ~myPieces;
+        while (bishopAttacks != 0) {
+            int to = Long.numberOfTrailingZeros(bishopAttacks);
+            bishopAttacks &= ~(1L << to);
+            list.add(new Move(sq, to));
+        }
+        return list;
+    }
+
+    // We'll do a simple approach for bishopAttacks
+    private long bishopAttacks(int sq, long occ) {
+        long mask = 0L;
+        mask |= rayAttack(sq, occ, 9);
+        mask |= rayAttack(sq, occ, 7);
+        mask |= rayAttack(sq, occ, -9);
+        mask |= rayAttack(sq, occ, -7);
+        return mask;
+    }
+
+    // -------------------------------------------------------------------------
+    // Rook moves (sliding)
+    // -------------------------------------------------------------------------
+    private List<Move> generateRookMoves(int sq, long bb, long myPieces) {
+        List<Move> list = new ArrayList<>();
+        long rookAttacks = rookAttacks(sq, getAllPieces()) & ~myPieces;
+        while (rookAttacks != 0) {
+            int to = Long.numberOfTrailingZeros(rookAttacks);
+            rookAttacks &= ~(1L << to);
+            list.add(new Move(sq, to));
+        }
+        return list;
+    }
+
+    private long rookAttacks(int sq, long occ) {
+        long mask = 0L;
+        mask |= rayAttack(sq, occ, 1);
+        mask |= rayAttack(sq, occ, -1);
+        mask |= rayAttack(sq, occ, 8);
+        mask |= rayAttack(sq, occ, -8);
+        return mask;
+    }
+
+    // -------------------------------------------------------------------------
+    // Queen moves = Rook + Bishop
+    // -------------------------------------------------------------------------
+    private List<Move> generateQueenMoves(int sq, long bb, long myPieces) {
+        List<Move> list = new ArrayList<>();
+        long queenAttacks = (rookAttacks(sq, getAllPieces()) | bishopAttacks(sq, getAllPieces()))
+                            & ~myPieces;
+        while (queenAttacks != 0) {
+            int to = Long.numberOfTrailingZeros(queenAttacks);
+            queenAttacks &= ~(1L << to);
+            list.add(new Move(sq, to));
+        }
+        return list;
+    }
+
+    // -------------------------------------------------------------------------
+    // King moves
+    // -------------------------------------------------------------------------
+    private List<Move> generateKingMoves(long kingBB, long myPieces) {
+        List<Move> list = new ArrayList<>();
+        if (kingBB == 0) return list; // shouldn't happen
+        int sq = Long.numberOfTrailingZeros(kingBB);
+        long attacks = kingAttacks(sq) & ~myPieces;
+        while (attacks != 0) {
+            int to = Long.numberOfTrailingZeros(attacks);
+            attacks &= ~(1L << to);
+            Move m = new Move(sq, to);
+            list.add(m);
+        }
+        return list;
+    }
+
+    private long kingAttacks(int sq) {
+        long mask = 0L;
+        int rank = sq / 8;
+        int file = sq % 8;
+        for (int dr = -1; dr <= 1; dr++) {
+            for (int df = -1; df <= 1; df++) {
+                if (dr == 0 && df == 0) continue;
+                int rr = rank + dr;
+                int ff = file + df;
+                if (rr >= 0 && rr < 8 && ff >= 0 && ff < 8) {
+                    mask |= 1L << (rr * 8 + ff);
+                }
+            }
+        }
+        return mask;
+    }
+
+    // -------------------------------------------------------------------------
+    // White castling
+    // -------------------------------------------------------------------------
+    private List<Move> generateWhiteCastlingMoves() {
+        List<Move> list = new ArrayList<>();
+        if (!whiteToMove) return list;
+        if ((WK & (1L << 4)) == 0) return list; // king not on e1
+        long occ = getAllPieces();
+        // White kingside
+        if ((castlingRights & WHITE_KINGSIDE) != 0) {
+            // squares f1, g1 must be empty
+            // king cannot be in check on e1, f1, g1
+            if (((occ & (1L << 5)) == 0) && ((occ & (1L << 6)) == 0)) {
+                if (!isSquareAttacked(4, false) &&
+                    !isSquareAttacked(5, false) &&
+                    !isSquareAttacked(6, false)) {
+                    Move m = new Move(4, 6);
+                    m.isCastling = true;
+                    list.add(m);
+                }
+            }
+        }
+        // White queenside
+        if ((castlingRights & WHITE_QUEENSIDE) != 0) {
+            // squares d1, c1, b1 must be empty
+            // king cannot be in check on e1, d1, c1
+            if (((occ & (1L << 3)) == 0) && ((occ & (1L << 2)) == 0) && ((occ & (1L << 1)) == 0)) {
+                if (!isSquareAttacked(4, false) &&
+                    !isSquareAttacked(3, false) &&
+                    !isSquareAttacked(2, false)) {
+                    Move m = new Move(4, 2);
+                    m.isCastling = true;
+                    list.add(m);
+                }
+            }
+        }
+        return list;
+    }
+
+    // -------------------------------------------------------------------------
+    // Black castling
+    // -------------------------------------------------------------------------
+    private List<Move> generateBlackCastlingMoves() {
+        List<Move> list = new ArrayList<>();
+        if (whiteToMove) return list;
+        if ((BK & (1L << 60)) == 0) return list; // king not on e8
+        long occ = getAllPieces();
+        // Black kingside
+        if ((castlingRights & BLACK_KINGSIDE) != 0) {
+            // squares f8=61, g8=62 must be empty
+            if (((occ & (1L << 61)) == 0) && ((occ & (1L << 62)) == 0)) {
+                // cannot be in check on e8, f8, g8
+                if (!isSquareAttacked(60, true) &&
+                    !isSquareAttacked(61, true) &&
+                    !isSquareAttacked(62, true)) {
+                    Move m = new Move(60, 62);
+                    m.isCastling = true;
+                    list.add(m);
+                }
+            }
+        }
+        // Black queenside
+        if ((castlingRights & BLACK_QUEENSIDE) != 0) {
+            // squares d8=59, c8=58, b8=57 must be empty
+            if (((occ & (1L << 59)) == 0) && ((occ & (1L << 58)) == 0) && ((occ & (1L << 57)) == 0)) {
+                if (!isSquareAttacked(60, true) &&
+                    !isSquareAttacked(59, true) &&
+                    !isSquareAttacked(58, true)) {
+                    Move m = new Move(60, 58);
+                    m.isCastling = true;
+                    list.add(m);
+                }
+            }
+        }
+        return list;
+    }
+
+    // -------------------------------------------------------------------------
+    // Executes a (pseudo-legal) move on the board. Does not check for legality.
+    // -------------------------------------------------------------------------
+    public void doMove(Move move) {
+        // We need to:
+        // 1) Identify which piece moved
+        // 2) Remove piece from 'from' bitboard, add to 'to'
+        // 3) Handle captures if any
+        // 4) Handle special cases: en passant, castling, promotion
+        // 5) Update castling rights if rooks/king move
+        // 6) Update enPassantSquare, halfmoveClock, etc.
+        // 7) Switch side is done outside this method
+
+        // Step 0: reset enPassantSquare
+        int oldEnPassant = enPassantSquare;
+        enPassantSquare = -1;
+
+        long fromMask = 1L << move.from;
+        long toMask   = 1L << move.to;
+
+        // Identify color
+        boolean isWhite = whiteToMove;
+
+        // Identify piece that moves
+        int pieceType = identifyPieceAtSquare(move.from, isWhite);
+        // If we can't find a piece, that would be an error in pseudo-legal generation
+
+        // Step 3: see if there's a capture (remove the opponent piece on 'to')
+        // En passant means capture is on a different square than 'to'
+        if (move.isEnPassant) {
+            if (isWhite) {
+                // black piece is captured behind
+                long capSquareMask = 1L << (move.to - 8);
+                BP &= ~capSquareMask;
+                BN &= ~capSquareMask;
+                BB &= ~capSquareMask;
+                BR &= ~capSquareMask;
+                BQ &= ~capSquareMask;
+                BK &= ~capSquareMask;
+            } else {
+                long capSquareMask = 1L << (move.to + 8);
+                WP &= ~capSquareMask;
+                WN &= ~capSquareMask;
+                WB &= ~capSquareMask;
+                WR &= ~capSquareMask;
+                WQ &= ~capSquareMask;
+                WK &= ~capSquareMask;
+            }
+        } else {
+            // Regular capture
+            if (isWhite) {
+                BP &= ~toMask;
+                BN &= ~toMask;
+                BB &= ~toMask;
+                BR &= ~toMask;
+                BQ &= ~toMask;
+                BK &= ~toMask; // typically king won't be captured in normal chess
+            } else {
+                WP &= ~toMask;
+                WN &= ~toMask;
+                WB &= ~toMask;
+                WR &= ~toMask;
+                WQ &= ~toMask;
+                WK &= ~toMask;
+            }
+        }
+
+        // Step 2: remove from 'from' bitboard, place on 'to'
+        switch (pieceType) {
+            case 1: // Pawn
+                if (isWhite) {
+                    WP &= ~fromMask;
+                    if (move.isPromotion) {
+                        // depends on promotionPiece
+                        switch (move.promotionPiece) {
+                            case 1: // Q
+                                WQ |= toMask; break;
+                            case 2: // R
+                                WR |= toMask; break;
+                            case 3: // B
+                                WB |= toMask; break;
+                            case 4: // N
+                                WN |= toMask; break;
+                        }
+                    } else {
+                        WP |= toMask;
+                    }
+                } else {
+                    BP &= ~fromMask;
+                    if (move.isPromotion) {
+                        // depends on promotionPiece
+                        switch (move.promotionPiece) {
+                            case 1: BQ |= toMask; break;
+                            case 2: BR |= toMask; break;
+                            case 3: BB |= toMask; break;
+                            case 4: BN |= toMask; break;
+                        }
+                    } else {
+                        BP |= toMask;
+                    }
+                }
+                // If a pawn moved or captured, halfmoveClock = 0
+                halfmoveClock = 0;
+                break;
+            case 2: // Knight
+                if (isWhite) {
+                    WN &= ~fromMask;
+                    WN |= toMask;
+                } else {
+                    BN &= ~fromMask;
+                    BN |= toMask;
+                }
+                // Knight move that is not a capture => halfmoveClock++
+                halfmoveClock++;
+                break;
+            case 3: // Bishop
+                if (isWhite) {
+                    WB &= ~fromMask;
+                    WB |= toMask;
+                } else {
+                    BB &= ~fromMask;
+                    BB |= toMask;
+                }
+                halfmoveClock++;
+                break;
+            case 4: // Rook
+                if (isWhite) {
+                    WR &= ~fromMask;
+                    WR |= toMask;
+                    // If rook moved from a1 or h1, remove castling rights
+                    if (move.from == 0) {
+                        castlingRights &= ~WHITE_QUEENSIDE;
+                    } else if (move.from == 7) {
+                        castlingRights &= ~WHITE_KINGSIDE;
+                    }
+                } else {
+                    BR &= ~fromMask;
+                    BR |= toMask;
+                    if (move.from == 56) {
+                        castlingRights &= ~BLACK_QUEENSIDE;
+                    } else if (move.from == 63) {
+                        castlingRights &= ~BLACK_KINGSIDE;
+                    }
+                }
+                halfmoveClock++;
+                break;
+            case 5: // Queen
+                if (isWhite) {
+                    WQ &= ~fromMask;
+                    WQ |= toMask;
+                } else {
+                    BQ &= ~fromMask;
+                    BQ |= toMask;
+                }
+                halfmoveClock++;
+                break;
+            case 6: // King
+                if (isWhite) {
+                    WK &= ~fromMask;
+                    WK |= toMask;
+                    // King moved => remove white's castling rights
+                    castlingRights &= ~(WHITE_KINGSIDE | WHITE_QUEENSIDE);
+
+                    // If castling, also move the rook
+                    if (move.isCastling) {
+                        if (move.to == 6) {
+                            // O-O
+                            WR &= ~(1L << 7);
+                            WR |= (1L << 5);
+                        } else if (move.to == 2) {
+                            // O-O-O
+                            WR &= ~(1L << 0);
+                            WR |= (1L << 3);
+                        }
+                    }
+                } else {
+                    BK &= ~fromMask;
+                    BK |= toMask;
+                    // King moved => remove black's castling rights
+                    castlingRights &= ~(BLACK_KINGSIDE | BLACK_QUEENSIDE);
+
+                    if (move.isCastling) {
+                        if (move.to == 62) {
+                            // O-O
+                            BR &= ~(1L << 63);
+                            BR |= (1L << 61);
+                        } else if (move.to == 58) {
+                            // O-O-O
+                            BR &= ~(1L << 56);
+                            BR |= (1L << 59);
+                        }
+                    }
+                }
+                halfmoveClock++;
+                break;
+        }
+
+        // If it was a capture (not enpassant?), halfmoveClock=0
+        if (!move.isEnPassant && ((toMask & (isWhite ? getBlackPieces() : getWhitePieces())) != 0)) {
+            halfmoveClock = 0;
+        }
+
+        // If it was any capture (including en passant), we've already removed the piece
+        // so that is handled above. halfmoveClock=0 if capture or pawn move
+        // This is already handled: we set to 0 for pawn moves, also do it for captures:
+        // But we've done that only for en passant. Let's unify logic:
+        // We can check if the 'to' square had an opponent piece (already removed it).
+        // We'll do it simpler: if there's a difference in occupancy. 
+        // But we've mostly done it, so let's trust the code above.
+
+        // Step 5: update castling rights if rooks are captured
+        if ((toMask & (1L << 0)) != 0) {
+            // White's a1 rook captured
+            castlingRights &= ~WHITE_QUEENSIDE;
+        }
+        if ((toMask & (1L << 7)) != 0) {
+            // White's h1 rook captured
+            castlingRights &= ~WHITE_KINGSIDE;
+        }
+        if ((toMask & (1L << 56)) != 0) {
+            // Black's a8 rook captured
+            castlingRights &= ~BLACK_QUEENSIDE;
+        }
+        if ((toMask & (1L << 63)) != 0) {
+            // Black's h8 rook captured
+            castlingRights &= ~BLACK_KINGSIDE;
+        }
+
+        // Step 6: set enPassantSquare if a pawn just moved two steps
+        if (pieceType == 1) {
+            if (isWhite) {
+                if ((move.to - move.from) == 16) {
+                    enPassantSquare = move.from + 8;
+                }
+            } else {
+                if ((move.from - move.to) == 16) {
+                    enPassantSquare = move.to + 8;
+                }
+            }
+        }
+
+        // If the move was a capture or pawn move, halfmoveClock = 0 (handled above).
+        // Otherwise halfmoveClock++ was done.
+
+        // done
+    }
+
+    // -------------------------------------------------------------------------
+    // Identify the piece at a given square for a given color
+    // Return an integer code for the piece: 1=Pawn,2=Knight,3=Bishop,4=Rook,5=Queen,6=King
+    // 0 if none
+    // -------------------------------------------------------------------------
+    private int identifyPieceAtSquare(int sq, boolean white) {
+        long mask = 1L << sq;
+        if (white) {
+            if ((WP & mask) != 0) return 1;
+            if ((WN & mask) != 0) return 2;
+            if ((WB & mask) != 0) return 3;
+            if ((WR & mask) != 0) return 4;
+            if ((WQ & mask) != 0) return 5;
+            if ((WK & mask) != 0) return 6;
+        } else {
+            if ((BP & mask) != 0) return 1;
+            if ((BN & mask) != 0) return 2;
+            if ((BB & mask) != 0) return 3;
+            if ((BR & mask) != 0) return 4;
+            if ((BQ & mask) != 0) return 5;
+            if ((BK & mask) != 0) return 6;
+        }
+        return 0;
+    }
+
+    // -------------------------------------------------------------------------
+    // Check if square is attacked by color
+    // For colorAttackingWhite==false means checking if black attacks the square
+    // -------------------------------------------------------------------------
+    private boolean isSquareAttacked(int sq, boolean byWhite) {
+        // Temporarily set sideToMove for convenience
+        boolean savedSide = whiteToMove;
+        whiteToMove = byWhite;
+        List<Move> pseudo = generateAllPseudoLegalMoves();
+        whiteToMove = savedSide;
+        for (Move m : pseudo) {
+            if (m.to == sq) {
+                // that means a piece from color 'byWhite' can move to 'sq', so sq is attacked
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // -------------------------------------------------------------------------
+    // Check if the given side's king is in check
+    // side==true => White's king
+    // -------------------------------------------------------------------------
+    private boolean isKingInCheck(boolean side) {
+        long kingBB = side ? WK : BK;
+        if (kingBB == 0) return false; // shouldn't happen in real games
+        int kingSq = Long.numberOfTrailingZeros(kingBB);
+        return isSquareAttacked(kingSq, !side);
+    }
+
+    // -------------------------------------------------------------------------
+    // Checkmate & Stalemate detection
+    // -------------------------------------------------------------------------
+    private boolean isCheckmate() {
+        // If side to move is in check, but has no legal moves => checkmate
+        if (!hasLegalMove()) {
+            // check if the side to move is in check
+            if (isKingInCheck(whiteToMove)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean isStalemate() {
+        // If side to move is not in check, but has no legal moves => stalemate
+        if (!isKingInCheck(whiteToMove) && !hasLegalMove()) {
+            return true;
+        }
+        return false;
+    }
+
+    private boolean hasLegalMove() {
+        List<Move> moves = generateLegalMoves();
+        return !moves.isEmpty();
+    }
+
+    // -------------------------------------------------------------------------
+    // Helper to collect all pieces in one bitboard
+    // -------------------------------------------------------------------------
+    private long getAllPieces() {
+        return (WP | WN | WB | WR | WQ | WK |
+                BP | BN | BB | BR | BQ | BK);
+    }
+
+    private long getWhitePieces() {
+        return (WP | WN | WB | WR | WQ | WK);
+    }
+
+    private long getBlackPieces() {
+        return (BP | BN | BB | BR | BQ | BK);
+    }
+
+    // -------------------------------------------------------------------------
+    // Sliding logic: trace a ray until hitting an occupied square or board edge
+    // -------------------------------------------------------------------------
+    private long rayAttack(int start, long occ, int step) {
+        long attacks = 0L;
+        int sq = start;
+        int rank = sq / 8;
+        int file = sq % 8;
+        while (true) {
+            int r2 = (sq + step) / 8;
+            int f2 = (sq + step) % 8;
+            // Check boundaries
+            if (r2 < 0 || r2 > 7 || f2 < 0 || f2 > 7) break;
+            // Also check for wrap-around in rank difference
+            int rankDiff = Math.abs(r2 - rank);
+            int fileDiff = Math.abs(f2 - file);
+            if (rankDiff > 1 && fileDiff > 1 && (step==7 || step==9 || step==-7 || step==-9)) {
+                // That can happen if we jumped too far in diagonal
+                // but typically not if we do increment one step at a time
+                break;
+            }
+            sq += step;
+            attacks |= (1L << sq);
+            if (((1L << sq) & occ) != 0) {
+                // square occupied => stop
+                break;
+            }
+            // keep going
+        }
+        return attacks;
+    }
+
+    // -------------------------------------------------------------------------
+    // Utility to print the board
+    // -------------------------------------------------------------------------
+    public void printBoard() {
+        System.out.println("   +-----------------+");
+        for (int r = 7; r >= 0; r--) {
+            System.out.print(" " + (r + 1) + " |");
+            for (int f = 0; f < 8; f++) {
+                int sq = r * 8 + f;
+                char c = pieceCharAt(sq);
+                System.out.print(c + " ");
+            }
+            System.out.println("|");
+        }
+        System.out.println("   +-----------------+");
+        System.out.println("    a b c d e f g h");
+        System.out.println();
+    }
+
+    private char pieceCharAt(int sq) {
+        long mask = 1L << sq;
+        if ((WP & mask) != 0) return 'P';
+        if ((WN & mask) != 0) return 'N';
+        if ((WB & mask) != 0) return 'B';
+        if ((WR & mask) != 0) return 'R';
+        if ((WQ & mask) != 0) return 'Q';
+        if ((WK & mask) != 0) return 'K';
+
+        if ((BP & mask) != 0) return 'p';
+        if ((BN & mask) != 0) return 'n';
+        if ((BB & mask) != 0) return 'b';
+        if ((BR & mask) != 0) return 'r';
+        if ((BQ & mask) != 0) return 'q';
+        if ((BK & mask) != 0) return 'k';
+
+        return '.';
+    }
+
+    // -------------------------------------------------------------------------
+    // Convert algebraic notation like "e2" to bitboard index
+    // -------------------------------------------------------------------------
+    private int notationToIndex(String sq) {
+        if (sq.length() != 2) return -1;
+        char fileChar = sq.charAt(0);
+        char rankChar = sq.charAt(1);
+
+        int file = fileChar - 'a';
+        int rank = rankChar - '1';
+        if (file < 0 || file > 7) return -1;
+        if (rank < 0 || rank > 7) return -1;
+        // bitboard index = 8*rank + file
+        return 8 * rank + file;
+    }
+
+    // -------------------------------------------------------------------------
+    // Converting promotion piece character to internal code
+    // We'll store 1=Q,2=R,3=B,4=N for simplicity
+    // -------------------------------------------------------------------------
+    private int charToPromotionPiece(char c, boolean sideWhite) {
+        switch (Character.toUpperCase(c)) {
+            case 'Q': return 1;
+            case 'R': return 2;
+            case 'B': return 3;
+            case 'N': return 4;
+        }
+        return 1; // default queen
+    }
+
+    // -------------------------------------------------------------------------
+    // BoardState class to backup/restore
+    // -------------------------------------------------------------------------
+    private static class BoardState {
+        long WP, WN, WB, WR, WQ, WK;
+        long BP, BN, BB, BR, BQ, BK;
+        boolean whiteToMove;
+        int castlingRights;
+        int enPassantSquare;
+        int halfmoveClock;
+        int fullmoveNumber;
+
+        BoardState(BitboardChess b) {
+            this.WP = b.WP; this.WN = b.WN; this.WB = b.WB; this.WR = b.WR; this.WQ = b.WQ; this.WK = b.WK;
+            this.BP = b.BP; this.BN = b.BN; this.BB = b.BB; this.BR = b.BR; this.BQ = b.BQ; this.BK = b.BK;
+            this.whiteToMove = b.whiteToMove;
+            this.castlingRights = b.castlingRights;
+            this.enPassantSquare = b.enPassantSquare;
+            this.halfmoveClock = b.halfmoveClock;
+            this.fullmoveNumber = b.fullmoveNumber;
+        }
+    }
+
+    private void restoreState(BoardState s) {
+        this.WP = s.WP; this.WN = s.WN; this.WB = s.WB; this.WR = s.WR; this.WQ = s.WQ; this.WK = s.WK;
+        this.BP = s.BP; this.BN = s.BN; this.BB = s.BB; this.BR = s.BR; this.BQ = s.BQ; this.BK = s.BK;
+        this.whiteToMove = s.whiteToMove;
+        this.castlingRights = s.castlingRights;
+        this.enPassantSquare = s.enPassantSquare;
+        this.halfmoveClock = s.halfmoveClock;
+        this.fullmoveNumber = s.fullmoveNumber;
+    }
+}
